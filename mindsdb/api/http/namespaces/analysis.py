@@ -3,7 +3,7 @@ import time
 from flask import request
 from flask_restx import Resource
 from pandas.core.frame import DataFrame
-
+from dataprep_ml.insights import analyze_dataset
 from mindsdb_sql import parse_sql
 from mindsdb_sql.parser.ast import Constant, Identifier
 from mindsdb_sql.planner.utils import query_traversal
@@ -12,6 +12,13 @@ from mindsdb.api.http.utils import http_error
 from mindsdb.api.http.namespaces.configs.analysis import ns_conf
 from mindsdb.api.mysql.mysql_proxy.classes.fake_mysql_proxy import FakeMysqlProxy
 from mindsdb.api.mysql.mysql_proxy.libs.constants.response_type import RESPONSE_TYPE as SQL_RESPONSE_TYPE
+
+
+def analyze_df(df: DataFrame) -> dict:
+    if len(df) == 0:
+        return {}
+    analysis = analyze_dataset(df)
+    return analysis.to_dict()
 
 
 @ns_conf.route('/query')
@@ -34,10 +41,7 @@ class QueryAnalysis(Resource):
             ast.limit = Constant(limit)
             query = str(ast)
 
-        mysql_proxy = FakeMysqlProxy(
-            company_id=request.company_id,
-            user_class=request.user_class
-        )
+        mysql_proxy = FakeMysqlProxy()
         mysql_proxy.set_context(context)
 
         try:
@@ -52,12 +56,9 @@ class QueryAnalysis(Resource):
         if result.type != SQL_RESPONSE_TYPE.TABLE:
             return http_error(500, 'Error', 'Query does not return data')
 
-        lw_handler = request.integration_controller.get_handler('lightwood')
-
         column_names = [x['name'] for x in result.columns]
-        analysis = lw_handler.analyze_dataset(
-            data_frame=DataFrame(result.data, columns=column_names)
-        )
+        df = DataFrame(result.data, columns=column_names)
+        analysis = analyze_df(df)
 
         query_tables = []
 
@@ -83,11 +84,7 @@ class DataAnalysis(Resource):
         column_names = payload.get('column_names')
         data = payload.get('data')
 
-        lw_handler = request.integration_controller.get_handler('lightwood')
-
-        analysis = lw_handler.analyze_dataset(
-            data_frame=DataFrame(data, columns=column_names)
-        )
+        analysis = analyze_df(DataFrame(data, columns=column_names))
 
         return {
             'analysis': analysis,

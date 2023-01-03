@@ -1,11 +1,13 @@
+import re
 from typing import Dict
 import pandas as pd
+from pyhive import (trino, sqlalchemy_trino)
 from mindsdb_sql import parse_sql, ASTNode
 from trino.auth import KerberosAuthentication, BasicAuthentication
 from trino.dbapi import connect
 from mindsdb_sql.render.sqlalchemy_render import SqlalchemyRender
-from mindsdb.integrations.libs.base_handler import DatabaseHandler
-from mindsdb.utilities.log import log
+from mindsdb.integrations.libs.base import DatabaseHandler
+from mindsdb.utilities import log
 from mindsdb.integrations.libs.response import (
     HandlerStatusResponse as StatusResponse,
     HandlerResponse as Response,
@@ -17,7 +19,8 @@ from .trino_config_provider import TrinoConfigProvider
 class TrinoHandler(DatabaseHandler):
     """
     This handler handles connection and execution of the Trino statements
-    using kerberos authentication
+
+    kerberos is not implemented yet
     """
 
     name = 'trino'
@@ -45,6 +48,7 @@ class TrinoHandler(DatabaseHandler):
         '''
         self.connection = None
         self.is_connected = False
+        self.with_clause = ""
 
     def connect(self):
         """"
@@ -52,16 +56,44 @@ class TrinoHandler(DatabaseHandler):
         """
         if self.is_connected is True:
             return self.connection
-        conn = connect(
-            host=self.connection_data['host'],
-            port=self.connection_data['port'],
-            user=self.connection_data['user'],
-            catalog=self.connection_data['catalog'],
-            schema=self.connection_data['schema'],
-            # @TODO: Implement Kerberos or Basic auth
-            # http_scheme='https',
-            # auth=BasicAuthentication(self.connection_data['user'], self.connection_data['password'])
-        )
+
+        # option configuration
+        http_scheme='http'
+        auth=None
+        auth_config=None
+        password=None
+
+        if 'auth' in self.connection_data:
+            auth=self.connection_data['auth']
+        if 'password' in self.connection_data:
+            password=self.connection_data['password']
+        if 'http_scheme' in self.connection_data:
+           http_scheme=self.connection_data['http_scheme']
+        if 'with' in self.connection_data:
+           self.with_clause=self.connection_data['with']
+
+        if password and auth=='kerberos':
+            raise Exception("Kerberos authorization doesn't support password.")
+        elif password:
+            auth_config=BasicAuthentication(self.connection_data['user'], password)
+
+        if auth:
+            conn = connect(
+                host=self.connection_data['host'],
+                port=self.connection_data['port'],
+                user=self.connection_data['user'],
+                catalog=self.connection_data['catalog'],
+                schema=self.connection_data['schema'],
+                http_scheme=http_scheme,
+                auth=auth_config)
+        else:
+            conn = connect(
+                host=self.connection_data['host'],
+                port=self.connection_data['port'],
+                user=self.connection_data['user'],
+                catalog=self.connection_data['catalog'],
+                schema=self.connection_data['schema'])
+
         self.is_connected = True
         self.connection = conn
         return conn
@@ -76,10 +108,10 @@ class TrinoHandler(DatabaseHandler):
         try:
             connection = self.connect()
             cur = connection.cursor()
-            cur.execute("SELECT 1;")
+            cur.execute("SELECT 1")
             response.success = True
         except Exception as e:
-            log.error(f'Error connecting to Trino {self.connection_data["schema"]}, {e}!')
+            log.logger.error(f'Error connecting to Trino {self.connection_data["schema"]}, {e}!')
             response.error_message = str(e)
 
         if response.success is False and self.is_connected is True:
@@ -109,7 +141,7 @@ class TrinoHandler(DatabaseHandler):
                 response = Response(RESPONSE_TYPE.OK)
             connection.commit()
         except Exception as e:
-            log.error(f'Error connecting to Trino {self.connection_data["schema"]}, {e}!')
+            log.logger.error(f'Error connecting to Trino {self.connection_data["schema"]}, {e}!')
             response = Response(
                 RESPONSE_TYPE.ERROR,
                 error_message=str(e)
@@ -117,10 +149,20 @@ class TrinoHandler(DatabaseHandler):
         return response
 
     def query(self, query: ASTNode) -> Response:
-        # @TODO: Detect to which DB is trino connected and use that dialect?
-        renderer = SqlalchemyRender('mysql')
+        # Utilize trino dialect from sqlalchemy
+        # implement WITH clause as default for all table
+        # in future, this behavior should be changed to support more detail
+        # level
+        # also, for simple the current implement is using rendered query string
+        # another method that directly manipulate ASTNOde is prefered
+        renderer = SqlalchemyRender(sqlalchemy_trino.TrinoDialect)
         query_str = renderer.get_string(query, with_failback=True)
-        return self.native_query(query_str)
+        modified_query_str = re.sub(
+            "(?is)(CREATE.+TABLE.+\(.*\))",
+            f"\\1 {self.with_clause}",
+            query_str
+        )
+        return self.native_query(modified_query_str)
 
     def get_tables(self) -> Response:
         """
@@ -129,6 +171,8 @@ class TrinoHandler(DatabaseHandler):
         """
         query = "SHOW TABLES"
         response = self.native_query(query)
+        df = response.data_frame
+        response.data_frame = df.rename(columns={df.columns[0]: 'table_name'})
         return response
 
     def get_columns(self, table_name: str) -> Dict:

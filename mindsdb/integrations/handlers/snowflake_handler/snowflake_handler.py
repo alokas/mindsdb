@@ -1,14 +1,17 @@
+from pandas import DataFrame
 from snowflake import connector
-from mindsdb.integrations.libs.base_handler import DatabaseHandler
+from snowflake.sqlalchemy import snowdialect
+
+from mindsdb_sql.render.sqlalchemy_render import SqlalchemyRender
+from mindsdb_sql.parser.ast.base import ASTNode
+
+from mindsdb.integrations.libs.base import DatabaseHandler
 from mindsdb.integrations.libs.response import (
     HandlerStatusResponse as StatusResponse,
     HandlerResponse as Response,
     RESPONSE_TYPE
 )
-from pandas import DataFrame
-from mindsdb_sql.render.sqlalchemy_render import SqlalchemyRender
-from mindsdb.utilities.log import log
-from mindsdb_sql.parser.ast.base import ASTNode
+from mindsdb.utilities import log
 
 
 class SnowflakeHandler(DatabaseHandler):
@@ -63,7 +66,7 @@ class SnowflakeHandler(DatabaseHandler):
                 cur.execute('select 1;')
             response.success = True
         except connector.errors.ProgrammingError as e:
-            log.error(f'Error connecting to Snowflake {self.connection_data["database"]}, {e}!')
+            log.logger.error(f'Error connecting to Snowflake {self.connection_data["database"]}, {e}!')
             response.error_message = e
 
         if response.success is True and need_to_close:
@@ -97,7 +100,7 @@ class SnowflakeHandler(DatabaseHandler):
                 else:
                     response = Response(RESPONSE_TYPE.OK)
             except Exception as e:
-                log.error(f'Error running query: {query} on {self.connection_data["database"]}!')
+                log.logger.error(f'Error running query: {query} on {self.connection_data["database"]}!')
                 response = Response(
                     RESPONSE_TYPE.ERROR,
                     error_message=str(e)
@@ -127,6 +130,6 @@ class SnowflakeHandler(DatabaseHandler):
         """
         Retrieve the data from the SQL statement.
         """
-        renderer = SqlalchemyRender('mysql')
+        renderer = SqlalchemyRender(snowdialect.dialect)
         query_str = renderer.get_string(query, with_failback=True)
         return self.native_query(query_str)

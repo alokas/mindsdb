@@ -4,6 +4,8 @@ from copy import deepcopy
 
 from mindsdb.utilities.fs import create_directory
 
+from mindsdb.utilities.fs import get_or_create_data_dir
+
 
 def _merge_key_recursive(target_dict, source_dict, key):
     if key not in target_dict:
@@ -22,37 +24,87 @@ def _merge_configs(original_config, override_config):
     return original_config
 
 
+config = None
+
+
 class Config():
     def __init__(self):
-        self.config_path = os.environ['MINDSDB_CONFIG_PATH']
+        # initialize once
+        global config
+        self.config_path = os.environ.get('MINDSDB_CONFIG_PATH', 'absent')
+        self.use_docker_env = os.environ.get('MINDSDB_DOCKER_ENV', False)
+        if self.use_docker_env:
+            self.use_docker_env = True
+        if config is None:
+            config = self.init_config()
+        self._config = config
+
+    def init_config(self):
+
         if self.config_path == 'absent':
             self._override_config = {}
         else:
             with open(self.config_path, 'r') as fp:
                 self._override_config = json.load(fp)
 
+        # region define storage dir
+        if 'storage_dir' in self._override_config:
+            root_storage_dir = self._override_config['storage_dir']
+            os.environ['MINDSDB_STORAGE_DIR'] = root_storage_dir
+        elif os.environ.get('MINDSDB_STORAGE_DIR') is not None:
+            root_storage_dir = os.environ['MINDSDB_STORAGE_DIR']
+        else:
+            root_storage_dir = get_or_create_data_dir()
+            os.environ['MINDSDB_STORAGE_DIR'] = root_storage_dir
+        # regionend
+
+        if os.path.isdir(root_storage_dir) is False:
+            os.makedirs(root_storage_dir)
+
+        if 'storage_db' in self._override_config:
+            os.environ['MINDSDB_DB_CON'] = self._override_config['storage_db']
+        elif os.environ.get('MINDSDB_DB_CON', '') == '':
+            os.environ['MINDSDB_DB_CON'] = 'sqlite:///' + os.path.join(root_storage_dir,
+                                                                       'mindsdb.sqlite3.db') + '?check_same_thread=False&timeout=30'
+
+        paths = {
+            'root': os.environ['MINDSDB_STORAGE_DIR']
+        }
+
+        # content - temporary storage for entities
+        paths['content'] = os.path.join(paths['root'], 'content')
+        # storage - persist storage for entities
+        paths['storage'] = os.path.join(paths['root'], 'storage')
+        paths['static'] = os.path.join(paths['root'], 'static')
+        paths['tmp'] = os.path.join(paths['root'], 'tmp')
+        paths['log'] = os.path.join(paths['root'], 'log')
+        paths['cache'] = os.path.join(paths['root'], 'cache')
+
+        for path_name in paths:
+            create_directory(paths[path_name])
+
         self._default_config = {
             'permanent_storage': {
                 'location': 'local'
             },
-            'paths': {},
+            'storage_dir': os.environ['MINDSDB_STORAGE_DIR'],
+            'paths': paths,
             "log": {
                 "level": {
                     "console": "INFO",
                     "file": "DEBUG",
                     "db": "WARNING"
                 }
-
             },
             "debug": False,
             "integrations": {},
             "api": {
                 "http": {
-                    "host": "127.0.0.1",
+                    "host": "127.0.0.1" if not self.use_docker_env else "0.0.0.0",
                     "port": "47334"
                 },
                 "mysql": {
-                    "host": "127.0.0.1",
+                    "host": "127.0.0.1" if not self.use_docker_env else "0.0.0.0",
                     "password": "",
                     "port": "47335",
                     "user": "mindsdb",
@@ -67,26 +119,10 @@ class Config():
             },
             "cache": {
                 "type": "local"
-            },
-            "force_dataset_removing": False
+            }
         }
 
-        self._default_config['paths']['root'] = os.environ['MINDSDB_STORAGE_DIR']
-        self._default_config['paths']['storage'] = os.path.join(self._default_config['paths']['root'], 'storage')
-        self._default_config['paths']['datasources'] = os.path.join(self._default_config['paths']['root'], 'datasources')
-        self._default_config['paths']['predictors'] = os.path.join(self._default_config['paths']['root'], 'predictors')
-        self._default_config['paths']['static'] = os.path.join(self._default_config['paths']['root'], 'static')
-        self._default_config['paths']['tmp'] = os.path.join(self._default_config['paths']['root'], 'tmp')
-        self._default_config['paths']['log'] = os.path.join(self._default_config['paths']['root'], 'log')
-        self._default_config['paths']['storage_dir'] = self._default_config['paths']['root']
-        self._default_config['paths']['cache'] = os.path.join(self._default_config['paths']['root'], 'cache')
-        self._default_config['paths']['integrations'] = os.path.join(self._default_config['paths']['root'], 'integrations')
-        self._default_config['storage_dir'] = self._default_config['paths']['root']
-
-        for path_name in self._default_config['paths']:
-            create_directory(self._default_config['paths'][path_name])
-
-        self._config = _merge_configs(self._default_config, self._override_config)
+        return _merge_configs(self._default_config, self._override_config)
 
     def __getitem__(self, key):
         return self._config[key]

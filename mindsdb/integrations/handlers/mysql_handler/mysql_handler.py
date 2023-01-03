@@ -8,8 +8,8 @@ from mindsdb_sql import parse_sql
 from mindsdb_sql.render.sqlalchemy_render import SqlalchemyRender
 from mindsdb_sql.parser.ast.base import ASTNode
 
-from mindsdb.utilities.log import log
-from mindsdb.integrations.libs.base_handler import DatabaseHandler
+from mindsdb.utilities import log
+from mindsdb.integrations.libs.base import DatabaseHandler
 from mindsdb.integrations.libs.response import (
     HandlerStatusResponse as StatusResponse,
     HandlerResponse as Response,
@@ -30,7 +30,7 @@ class MySQLHandler(DatabaseHandler):
         self.mysql_url = None
         self.parser = parse_sql
         self.dialect = 'mysql'
-        self.connection_data = kwargs.get('connection_data')
+        self.connection_data = kwargs.get('connection_data', {})
         self.database = self.connection_data.get('database')
 
         self.connection = None
@@ -90,7 +90,7 @@ class MySQLHandler(DatabaseHandler):
             connection = self.connect()
             result.success = connection.is_connected()
         except Exception as e:
-            log.error(f'Error connecting to MySQL {self.connection_data["database"]}, {e}!')
+            log.logger.error(f'Error connecting to MySQL {self.connection_data["database"]}, {e}!')
             result.error_message = str(e)
 
         if result.success is True and need_to_close:
@@ -126,7 +126,7 @@ class MySQLHandler(DatabaseHandler):
                     response = Response(RESPONSE_TYPE.OK)
                 connection.commit()
             except Exception as e:
-                log.error(f'Error running query: {query} on {self.connection_data["database"]}!')
+                log.logger.error(f'Error running query: {query} on {self.connection_data["database"]}!')
                 response = Response(
                     RESPONSE_TYPE.ERROR,
                     error_message=str(e)
@@ -163,18 +163,6 @@ class MySQLHandler(DatabaseHandler):
         q = f"DESCRIBE {table_name};"
         result = self.native_query(q)
         return result
-
-    def select_into(self, table, dataframe: pd.DataFrame, dtypes=None):
-        """
-        TODO: Update this
-        """
-        try:
-            con = create_engine(f'mysql://{self.host}:{self.port}/{self.database}', echo=False)
-            dataframe.to_sql(table, con=con, if_exists='append', index=False, dtype=dtypes)
-            return True
-        except Exception as e:
-            print(e)
-            raise Exception(f"Could not select into table {table}, aborting.")
 
 
 connection_args = OrderedDict(

@@ -3,21 +3,25 @@ import json
 import datetime
 
 import numpy as np
-from sqlalchemy import create_engine, orm, types, UniqueConstraint
+from sqlalchemy import create_engine, types, UniqueConstraint
 from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy import Column, Integer, String, DateTime, Boolean, Index
-from sqlalchemy.sql.expression import null
 from sqlalchemy.sql.schema import ForeignKey
+from sqlalchemy import JSON
 
-
-if os.environ['MINDSDB_DB_CON'].startswith('sqlite:'):
-    engine = create_engine(os.environ['MINDSDB_DB_CON'], echo=False)
-else:
-    engine = create_engine(os.environ['MINDSDB_DB_CON'], convert_unicode=True, pool_size=30, max_overflow=200, echo=False)
 Base = declarative_base()
-session = scoped_session(sessionmaker(bind=engine, autoflush=True))
-Base.query = session.query_property()
+session, engine = None, None
+
+
+def init():
+    global Base, session, engine
+    if os.environ['MINDSDB_DB_CON'].startswith('sqlite:'):
+        engine = create_engine(os.environ['MINDSDB_DB_CON'], echo=False)
+    else:
+        engine = create_engine(os.environ['MINDSDB_DB_CON'], convert_unicode=True, pool_size=30, max_overflow=200, echo=False)
+    session = scoped_session(sessionmaker(bind=engine, autoflush=True))
+    Base.query = session.query_property()
 
 
 # Source: https://stackoverflow.com/questions/26646362/numpy-array-is-not-json-serializable
@@ -57,6 +61,8 @@ class Json(types.TypeDecorator):
         return json.dumps(value, cls=NumpyEncoder) if value is not None else None
 
     def process_result_value(self, value, dialect):  # select
+        if isinstance(value, dict):
+            return value
         return json.loads(value) if value is not None else None
 
 
@@ -70,7 +76,23 @@ class Semaphor(Base):
     entity_id = Column('entity_id', Integer)
     action = Column(String)
     company_id = Column(Integer)
-    uniq_const = UniqueConstraint('entity_type', 'entity_id')
+    __table_args__ = (
+        UniqueConstraint('entity_type', 'entity_id', name='uniq_const'),
+    )
+
+
+class PREDICTOR_STATUS:
+    __slots__ = ()
+    COMPLETE = 'complete'
+    TRAINING = 'training'
+    ADJUSTING = 'adjusting'
+    GENERATING = 'generating'
+    ERROR = 'error'
+    VALIDATION = 'validation'
+    DELETED = 'deleted'  # TODO remove it?
+
+
+PREDICTOR_STATUS = PREDICTOR_STATUS()
 
 
 class Predictor(Base):
@@ -79,27 +101,46 @@ class Predictor(Base):
     id = Column(Integer, primary_key=True)
     updated_at = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now)
     created_at = Column(DateTime, default=datetime.datetime.now)
+    deleted_at = Column(DateTime)
     name = Column(String)
     data = Column(Json)  # A JSON -- should be everything returned by `get_model_data`, I think
     to_predict = Column(Array)
     company_id = Column(Integer)
     mindsdb_version = Column(String)
     native_version = Column(String)
-    integration_id = Column(ForeignKey('integration.id', name='fk_integration_id'), nullable=True)
+    integration_id = Column(ForeignKey('integration.id', name='fk_integration_id'), nullable=False)
+    data_integration_ref = Column(Json)
     fetch_data_query = Column(String)
     is_custom = Column(Boolean)
     learn_args = Column(Json)
     update_status = Column(String, default='up_to_date')
+    status = Column(String)
+    active = Column(Boolean, default=True)
     training_data_columns_count = Column(Integer)
     training_data_rows_count = Column(Integer)
     training_start_at = Column(DateTime)
     training_stop_at = Column(DateTime)
+    label = Column(String, nullable=True)
+    version = Column(Integer, default=1)
 
-    json_ai = Column(Json, nullable=True)
     code = Column(String, nullable=True)
     lightwood_version = Column(String, nullable=True)
     dtype_dict = Column(Json, nullable=True)
-    uniq_const = UniqueConstraint('name', 'company_id', name='unique_name_company_id')
+    project_id = Column(Integer, ForeignKey('project.id', name='fk_project_id'), nullable=False)
+
+
+class Project(Base):
+    __tablename__ = 'project'
+
+    id = Column(Integer, primary_key=True)
+    created_at = Column(DateTime, default=datetime.datetime.now)
+    updated_at = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now)
+    deleted_at = Column(DateTime)
+    name = Column(String, nullable=False)
+    company_id = Column(Integer)
+    __table_args__ = (
+        UniqueConstraint('name', 'company_id', name='unique_project_name_company_id'),
+    )
 
 
 class Log(Base):
@@ -123,7 +164,9 @@ class Integration(Base):
     engine = Column(String, nullable=False)
     data = Column(Json)
     company_id = Column(Integer)
-    uniq_const = UniqueConstraint('name', 'company_id', name='unique_name_company_id')
+    __table_args__ = (
+        UniqueConstraint('name', 'company_id', name='unique_integration_name_company_id'),
+    )
 
 
 class Stream(Base):
@@ -155,7 +198,9 @@ class File(Base):
     columns = Column(Json, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.now)
     updated_at = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now)
-    uniq_const = UniqueConstraint('name', 'company_id', name='unique_name_company_id')
+    __table_args__ = (
+        UniqueConstraint('name', 'company_id', name='unique_file_name_company_id'),
+    )
 
 
 class View(Base):
@@ -164,8 +209,20 @@ class View(Base):
     name = Column(String, nullable=False)
     company_id = Column(Integer)
     query = Column(String, nullable=False)
-    uniq_const = UniqueConstraint('name', 'company_id', name='unique_name_company_id')
+    project_id = Column(Integer, ForeignKey('project.id', name='fk_project_id'), nullable=False)
+    __table_args__ = (
+        UniqueConstraint('name', 'company_id', name='unique_view_name_company_id'),
+    )
 
+
+class JsonStorage(Base):
+    __tablename__ = 'json_storage'
+    id = Column(Integer, primary_key=True)
+    resource_group = Column(String)
+    resource_id = Column(Integer)
+    name = Column(String)
+    content = Column(JSON)
+    company_id = Column(Integer)
 
 # DDL is changing through migrations
 # Base.metadata.create_all(engine)

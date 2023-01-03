@@ -1,67 +1,25 @@
-import os
 import sys
 import json
-import traceback
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Union, Any
 import copy
-from dateutil.parser import parse as parse_datetime
+from typing import Optional, Dict
+from datetime import datetime
 
-import psutil
-import sqlalchemy
 import pandas as pd
+from type_infer.dtype import dtype
 import lightwood
-from lightwood.api.types import JsonAI
-from lightwood.api.high_level import json_ai_from_problem, predictor_from_code, ProblemDefinition
-from mindsdb_sql import parse_sql
-from mindsdb_sql.parser.ast.base import ASTNode
-from mindsdb_sql.parser.ast import Join, BinaryOperation, Identifier, Constant, Select, OrderBy, Show
-from mindsdb_sql.parser.dialects.mindsdb import (
-    RetrainPredictor,
-    CreatePredictor,
-    DropPredictor
-)
-from lightwood import __version__ as lightwood_version
-from lightwood.api import dtype
 import numpy as np
 
-from mindsdb.integrations.libs.base_handler import BaseHandler, PredictiveHandler
-from mindsdb.integrations.libs.utils import recur_get_conditionals, get_aliased_columns, get_join_input, get_model_name
-from mindsdb.utilities.config import Config
-from mindsdb.utilities.functions import mark_process
 import mindsdb.interfaces.storage.db as db
-from mindsdb.integrations.libs.response import (
-    HandlerStatusResponse as StatusResponse,
-    HandlerResponse as Response,
-    RESPONSE_TYPE
-)
-from mindsdb import __version__ as mindsdb_version
-from mindsdb.utilities.functions import cast_row_types
-from mindsdb.utilities.hooks import after_predict as after_predict_hook
-from mindsdb.utilities.with_kwargs_wrapper import WithKWArgsWrapper
-from mindsdb.interfaces.model.model_controller import ModelController
 
-from .learn_process import brack_to_mod, rep_recur, LearnProcess, UpdateProcess
-from .utils import unpack_jsonai_old_args, load_predictor
-from .join_utils import get_ts_join_input
+from mindsdb.utilities.functions import cast_row_types
+# from mindsdb.utilities.hooks import after_predict as after_predict_hook
+from mindsdb.interfaces.model.functions import get_model_record
+from mindsdb.interfaces.storage.json import get_json_storage
+from mindsdb.integrations.libs.base import BaseMLEngine
+
+from .functions import run_learn, run_adjust
 
 IS_PY36 = sys.version_info[1] <= 6
-
-
-def get_where_data(where):
-    result = {}
-    if type(where) != BinaryOperation:
-        raise Exception("Wrong 'where' statement")
-    if where.op == '=':
-        if type(where.args[0]) != Identifier or type(where.args[1]) != Constant:
-            raise Exception("Wrong 'where' statement")
-        result[where.args[0].parts[-1]] = where.args[1].value
-    elif where.op == 'and':
-        result.update(get_where_data(where.args[0]))
-        result.update(get_where_data(where.args[1]))
-    else:
-        raise Exception("Wrong 'where' statement")
-    return result
 
 
 class NumpyJSONEncoder(json.JSONEncoder):
@@ -73,6 +31,7 @@ class NumpyJSONEncoder(json.JSONEncoder):
     x = np.float32(5)
     json.dumps(x, cls=NumpyJSONEncoder)
     """
+
     def default(self, obj):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
@@ -82,359 +41,97 @@ class NumpyJSONEncoder(json.JSONEncoder):
             return super().default(obj)
 
 
-class LightwoodHandler(PredictiveHandler):
-
+class LightwoodHandler(BaseMLEngine):
     name = 'lightwood'
-    predictor_cache: Dict[str, Dict[str, Union[Any]]]
 
-    def __init__(self, name, **kwargs):
-        """ Lightwood AutoML integration """  # noqa
-        super().__init__(name)
-        self.predictor_cache = {}
-        self.config = Config()
-        self.storage = None
-        self.parser = parse_sql
-        self.dialect = 'mindsdb'
-        self.handler_dialect = 'mysql'
+    @staticmethod
+    def create_validation(target, args=None, **kwargs):
+        if 'df' not in kwargs:
+            return
+        df = kwargs['df']
+        columns = [x.lower() for x in df.columns]
+        if target.lower() not in columns:
+            raise Exception(f"There is no column '{target}' in dataframe")
 
-        self.lw_dtypes_to_sql = {
-            "integer": sqlalchemy.Integer,
-            "float": sqlalchemy.Float,
-            "quantity": sqlalchemy.Float,
-            "binary": sqlalchemy.Text,
-            "categorical": sqlalchemy.Text,
-            "tags": sqlalchemy.Text,
-            "date": sqlalchemy.DateTime,
-            "datetime": sqlalchemy.DateTime,
-            "short_text": sqlalchemy.Text,
-            "rich_text": sqlalchemy.Text,
-            "num_array": sqlalchemy.Text,
-            "cat_array": sqlalchemy.Text,
-            "num_tsarray": sqlalchemy.Text,
-            "cat_tsarray": sqlalchemy.Text,
-            "empty": sqlalchemy.Text,
-            "invalid": sqlalchemy.Text,
-        }  # image, audio, video not supported
-        self.lw_dtypes_overrides = {
-            'original_index': sqlalchemy.Integer,
-            'confidence': sqlalchemy.Float,
-            'lower': sqlalchemy.Float,
-            'upper': sqlalchemy.Float
-        }
+        if 'timeseries_settings' in args and args['timeseries_settings'].get('is_timeseries') is True:
+            tss = args['timeseries_settings']
+            if 'order_by' in tss and tss['order_by'].lower() not in columns:
+                raise Exception(f"There is no column '{tss['order_by']}' in dataframe")
+            if isinstance(tss.get('group_by'), list):
+                for column in tss['group_by']:
+                    if column.lower() not in columns:
+                        raise Exception(f"There is no column '{column}' in dataframe")
 
-        self.handler_controller = kwargs.get('handler_controller')
-        self.fs_store = kwargs.get('fs_store')
-        self.company_id = kwargs.get('company_id')
-        self.model_controller = WithKWArgsWrapper(
-            ModelController(),
-            company_id=self.company_id
+    def create(self, target: str, df: Optional[pd.DataFrame] = None, args: Optional[Dict] = None) -> None:
+        args['target'] = target
+        run_learn(
+            df,
+            args,   # Problem definition and JsonAI override
+            self.model_storage
         )
 
-    def check_connection(self) -> Dict[str, int]:
-        try:
-            year, major, minor, hotfix = lightwood.__version__.split('.')
-            assert int(year) > 22 or (int(year) == 22 and int(major) >= 4)
-            print("Lightwood OK!")
-            return {'status': '200'}
-        except AssertionError as e:
-            print("Cannot import lightwood!")
-            return {'status': '503', 'error': e}
-
-    def get_tables(self) -> Response:
-        """ Returns list of model names (that have been succesfully linked with CREATE PREDICTOR) """  # noqa
-        q = "SHOW TABLES;"
-        result = self.native_query(q)
-        result.data_frame = result.data_frame.rename(
-            columns={result.data_frame.columns[0]: 'table_name'}
-        )
-        return result
-
-    def _get_tables_names(self) -> List[str]:
-        response = self.get_tables()
-        data = response.data_frame.to_dict(orient='records')
-        return [x['table_name'] for x in data]
-
-    def get_columns(self, table_name: str) -> Response:
-        """ For getting standard info about a table. e.g. data types """  # noqa
-        predictor_record = db.Predictor.query.filter_by(
-            company_id=self.company_id, name=table_name
-        ).first()
-        if predictor_record is None:
-            return Response(
-                RESPONSE_TYPE.ERROR,
-                error_message=f"Error: model '{table_name}' does not exists!"
-            )
-
-        data = []
-        if predictor_record.dtype_dict is not None:
-            for key, value in predictor_record.dtype_dict.items():
-                data.append((key, value))
-        result = Response(
-            RESPONSE_TYPE.TABLE,
-            pd.DataFrame(
-                data,
-                columns=['COLUMN_NAME', 'DATA_TYPE']
-            )
-        )
-        return result
-
-    @mark_process(name='learn')
-    def _learn(self, statement):
-        model_name = statement.name.parts[-1]
-
-        if model_name in self._get_tables_names():
-            return Response(
-                RESPONSE_TYPE.ERROR,
-                error_message="Error: this model already exists!"
-            )
-
-        target = statement.targets[0].parts[-1]
-        problem_definition_dict = {
-            'target': target
-        }
-        if statement.order_by:
-            order_by = statement.order_by[0].field.parts[-1]
-            group_by = None
-            if statement.group_by is not None:
-                group_by = [x.parts[-1] for x in statement.group_by]
-
-            problem_definition_dict['timeseries_settings'] = {
-                'is_timeseries': True,
-                'order_by': order_by,
-                'group_by': group_by,
-                'window': int(statement.window),
-                'horizon': int(statement.horizon),
-            }
-
-        json_ai_override = statement.using if statement.using else {}
-
-        join_learn_process = False
-        if 'join_learn_process' in json_ai_override:
-            join_learn_process = json_ai_override['join_learn_process']
-            del json_ai_override['join_learn_process']
-
-        unpack_jsonai_old_args(json_ai_override)
-
-        integration_name = str(statement.integration_name)
-        handler = self.handler_controller.get_handler(integration_name)
-        response = handler.native_query(statement.query_str)
-        if response.type == RESPONSE_TYPE.ERROR:
-            return response
-        training_data_df = response.data_frame
-
-        integration_meta = self.handler_controller.get(name=integration_name)
-        problem_definition = ProblemDefinition.from_dict(problem_definition_dict)
-
-        predictor_record = db.Predictor(
-            company_id=self.company_id,
-            name=model_name,
-            integration_id=integration_meta['id'],
-            fetch_data_query=statement.query_str,
-            mindsdb_version=mindsdb_version,
-            lightwood_version=lightwood_version,
-            to_predict=problem_definition.target,
-            learn_args=problem_definition.to_dict(),
-            data={'name': model_name},
-            training_data_columns_count=len(training_data_df.columns),
-            training_data_rows_count=len(training_data_df),
-            training_start_at=datetime.now()
+    def update(self, df: Optional[pd.DataFrame] = None, args: Optional[Dict] = None) -> None:
+        run_adjust(
+            df,
+            args,
+            self.model_storage
         )
 
-        db.session.add(predictor_record)
-        db.session.commit()
+    def predict(self, df, args=None):
+        pred_format = args['pred_format']
+        predictor_code = args['code']
+        learn_args = args['learn_args']
+        pred_args = args.get('predict_params', {})
+        self.model_storage.fileStorage.pull()
 
-        predictor_id = predictor_record.id
+        predictor = lightwood.predictor_from_state(
+            self.model_storage.fileStorage.folder_path / self.model_storage.fileStorage.folder_name,
+            predictor_code
+        )
+        dtype_dict = predictor.dtype_dict
 
-        p = LearnProcess(training_data_df, problem_definition, predictor_id, json_ai_override)
-        p.start()
-        if join_learn_process:
-            p.join()
-            if not IS_PY36:
-                p.close()
-
-        db.session.refresh(predictor_record)
-
-        return Response(RESPONSE_TYPE.OK)
-
-    @mark_process(name='learn')
-    def _retrain(self, statement):
-        model_name = statement.name.parts[-1]
-
-        predictor_record = db.Predictor.query.filter_by(
-            company_id=self.company_id, name=model_name
-        ).first()
-        if predictor_record is None:
-            return Response(
-                RESPONSE_TYPE.ERROR,
-                error_message=f"Error: model '{model_name}' does not exists!"
-            )
-
-        predictor_record.update_status = 'updating'
-        db.session.commit()
-
-        handler_meta = self.handler_controller.get_by_id(predictor_record.integration_id)
-        handler = self.handler_controller.get_handler(handler_meta['name'])
-        ast = self.parser(predictor_record.fetch_data_query, dialect=self.dialect)
-        response = handler.query(ast)
-        if response.type == RESPONSE_TYPE.ERROR:
-            return response
-
-        p = UpdateProcess(model_name, response.data_frame, self.company_id)
-        p.start()
-
-        return Response(RESPONSE_TYPE.OK)
-
-    def _drop(self, statement):
-        model_name = statement.name.parts[-1]
-
-        existing_predictors_names = [x.lower() for x in self._get_tables_names()]
-        if model_name not in existing_predictors_names:
-            return Response(
-                RESPONSE_TYPE.ERROR,
-                error_message=f"Model '{model_name}' does not exist"
-            )
-
-        predictor_record = db.session.query(db.Predictor).filter_by(company_id=self.company_id, name=model_name).first()
-        if predictor_record is None:
-            raise Exception(f"Predictor '{model_name}' does not exist")
-
-        is_cloud = self.config.get('cloud', False)
-        model = self.model_controller.get_model_data(predictor_record.name, company_id=self.company_id)
-        if (
-            is_cloud is True
-            and model.get('status') in ['generating', 'training']
-            and isinstance(model.get('created_at'), str) is True
-            and (datetime.datetime.now() - parse_datetime(model.get('created_at'))) < datetime.timedelta(hours=1)
-        ):
-            raise Exception('You are unable to delete models currently in progress, please wait before trying again')
-
-        db.session.delete(predictor_record)
-        db.session.commit()
-
-        self.fs_store.delete(f'predictor_{self.company_id}_{predictor_record.id}')
-
-        return Response(RESPONSE_TYPE.OK)
-
-    def native_query(self, query: str) -> Response:
-        query_ast = self.parser(query, dialect=self.dialect)
-        return self.query(query_ast)
-
-    def query(self, query: ASTNode) -> Response:
-        statement = query
-
-        if type(statement) == Show:
-            if statement.category.lower() == 'tables':
-                all_models = self.model_controller.get_models()
-                all_models_names = [[x['name']] for x in all_models]
-                response = Response(
-                    RESPONSE_TYPE.TABLE,
-                    pd.DataFrame(
-                        all_models_names,
-                        columns=['table_name']
-                    )
-                )
-                return response
-            else:
-                response = Response(
-                    RESPONSE_TYPE.ERROR,
-                    error_message=f"Cant determine how to show '{statement.category}'"
-                )
-            return response
-        if type(statement) == CreatePredictor:
-            # TODO cast columns to datasource case!
-            return self._learn(statement)
-        elif type(statement) == RetrainPredictor:
-            return self._retrain(statement)
-        elif type(statement) == DropPredictor:
-            return self._drop(statement)
-        elif type(statement) == Select:
-            model_name = statement.from_table.parts[-1]
-            where_data = get_where_data(statement.where)
-            predictions = self.predict(model_name, where_data)
-            return Response(
-                RESPONSE_TYPE.TABLE,
-                data_frame=pd.DataFrame(predictions)
-            )
-        else:
-            raise Exception(f"Query type {type(statement)} not supported")
-
-    @mark_process(name='predict')
-    def predict(self, model_name: str, data: list, pred_format: str = 'dict') -> pd.DataFrame:
-        if isinstance(data, dict):
-            data = [data]
-        df = pd.DataFrame(data)
-        predictor_record = db.Predictor.query.filter_by(
-            company_id=self.company_id, name=model_name
-        ).first()
-        if predictor_record is None:
-            return Response(
-                RESPONSE_TYPE.ERROR,
-                error_message=f"Error: model '{model_name}' does not exists!"
-            )
-
-        fs_name = f'predictor_{self.company_id}_{predictor_record.id}'
-
-        model_data = self.model_controller.get_model_data(model_name, company_id=self.company_id)
-
-        # regon LoadCache
-        if (
-            model_name in self.predictor_cache
-            and self.predictor_cache[model_name]['updated_at'] != predictor_record.updated_at
-        ):
-            del self.predictor_cache[model_name]
-
-        if model_name not in self.predictor_cache:
-            # Clear the cache entirely if we have less than 1.2 GB left
-            if psutil.virtual_memory().available < 1.2 * pow(10, 9):
-                self.predictor_cache = {}
-
-            if model_data['status'] == 'complete':
-                self.fs_store.get(fs_name, base_dir=self.config['paths']['predictors'])
-                self.predictor_cache[model_name] = {
-                    'predictor': lightwood.predictor_from_state(
-                        os.path.join(self.config['paths']['predictors'], fs_name),
-                        predictor_record.code
-                    ),
-                    'updated_at': predictor_record.updated_at,
-                    'created': datetime.now(),
-                    'code': predictor_record.code,
-                    'pickle': str(os.path.join(self.config['paths']['predictors'], fs_name))
-                }
-            else:
-                raise Exception(
-                    f"Trying to predict using predictor '{model_name}' with status: {model_data['status']}. Error is: {model_data.get('error', 'unknown')}"
-                )
-        # endregion
-
-        predictor = self.predictor_cache[model_name]['predictor']
-        predictions = predictor.predict(df)
+        predictions = predictor.predict(df, args=pred_args)
         predictions = predictions.to_dict(orient='records')
 
-        after_predict_hook(
-            company_id=self.company_id,
-            predictor_id=predictor_record.id,
-            rows_in_count=df.shape[0],
-            columns_in_count=df.shape[1],
-            rows_out_count=len(predictions)
-        )
+        # TODO!!!
+        # after_predict_hook(
+        #     company_id=self.company_id,
+        #     predictor_id=predictor_record.id,
+        #     rows_in_count=df.shape[0],
+        #     columns_in_count=df.shape[1],
+        #     rows_out_count=len(predictions)
+        # )
 
         # region format result
-        target = predictor_record.to_predict[0]
+        target = args['target']
         explain_arr = []
         pred_dicts = []
         for i, row in enumerate(predictions):
-            obj = {
-                target: {
-                    'predicted_value': row['prediction'],
-                    'confidence': row.get('confidence', None),
-                    'anomaly': row.get('anomaly', None),
-                    'truth': row.get('truth', None)
-                }
+            values = {
+                'predicted_value': row['prediction'],
+                'confidence': row.get('confidence', None),
+                'anomaly': row.get('anomaly', None),
+                'truth': row.get('truth', None)
             }
-            if 'lower' in row:
-                obj[target]['confidence_lower_bound'] = row.get('lower', None)
-                obj[target]['confidence_upper_bound'] = row.get('upper', None)
 
+            if predictor.supports_proba:
+                for cls in predictor.statistical_analysis.train_observed_classes:
+                    if row.get(f'__mdb_proba_{cls}', False):
+                        values[f'probability_class_{cls}'] = round(row[f'__mdb_proba_{cls}'], 4)
+
+            for block in predictor.analysis_blocks:
+                if type(block).__name__ == 'ShapleyValues':
+                    cols = block.columns
+                    values['shap_base_response'] = round(row['shap_base_response'], 4)
+                    values['shap_final_response'] = round(row['shap_final_response'], 4)
+                    for col in cols:
+                        values[f'shap_contribution_{col}'] = round(row[f'shap_contribution_{col}'], 4)
+
+            if 'lower' in row:
+                values['confidence_lower_bound'] = row.get('lower', None)
+                values['confidence_upper_bound'] = row.get('upper', None)
+
+            obj = {target: values}
             explain_arr.append(obj)
 
             td = {'predicted_value': row['prediction']}
@@ -462,8 +159,8 @@ class LightwoodHandler(PredictiveHandler):
             new_pred_dicts.append(new_row)
         pred_dicts = new_pred_dicts
 
-        columns = list(predictor_record.dtype_dict.keys())
-        predicted_columns = predictor_record.to_predict
+        columns = list(dtype_dict.keys())
+        predicted_columns = target
         if not isinstance(predicted_columns, list):
             predicted_columns = [predicted_columns]
         # endregion
@@ -476,13 +173,16 @@ class LightwoodHandler(PredictiveHandler):
                 original_target_values[col + '_original'].append(row.get(col))
 
         # region transform ts predictions
-        timeseries_settings = predictor_record.learn_args['timeseries_settings']
+        timeseries_settings = learn_args.get('timeseries_settings', {'is_timeseries': False})
 
         if timeseries_settings['is_timeseries'] is True:
-            __no_forecast_offset = set([row.get('__mdb_forecast_offset', None) for row in pred_dicts]) == {None}
+            # offset forecast if have __mdb_forecast_offset > 0
+            forecast_offset = any([
+                row.get('__mdb_forecast_offset') is not None and row['__mdb_forecast_offset'] > 0
+                for row in pred_dicts
+            ])
 
-            predict = predictor_record.to_predict[0]
-            group_by = timeseries_settings['group_by'] or []
+            group_by = timeseries_settings.get('group_by', [])
             order_by_column = timeseries_settings['order_by']
             if isinstance(order_by_column, list):
                 order_by_column = order_by_column[0]
@@ -519,7 +219,7 @@ class LightwoodHandler(PredictiveHandler):
                     break
 
                 for row in rows:
-                    predictions = row[predict]
+                    predictions = row[target]
                     if isinstance(predictions, list) is False:
                         predictions = [predictions]
 
@@ -529,32 +229,32 @@ class LightwoodHandler(PredictiveHandler):
 
                 for i in range(len(rows) - 1):
                     if horizon > 1:
-                        rows[i][predict] = rows[i][predict][0]
+                        rows[i][target] = rows[i][target][0]
                         if isinstance(rows[i][order_by_column], list):
                             rows[i][order_by_column] = rows[i][order_by_column][0]
                     for col in ('predicted_value', 'confidence', 'confidence_lower_bound', 'confidence_upper_bound'):
-                        if horizon > 1:
-                            explanations[i][predict][col] = explanations[i][predict][col][0]
+                        if horizon > 1 and col in explanations[i][target]:
+                            explanations[i][target][col] = explanations[i][target][col][0]
 
                 last_row = rows.pop()
                 last_explanation = explanations.pop()
                 for i in range(horizon):
                     new_row = copy.deepcopy(last_row)
                     if horizon > 1:
-                        new_row[predict] = new_row[predict][i]
+                        new_row[target] = new_row[target][i]
                         if isinstance(new_row[order_by_column], list):
                             new_row[order_by_column] = new_row[order_by_column][i]
-                    if '__mindsdb_row_id' in new_row and (i > 0 or __no_forecast_offset):
+                    if '__mindsdb_row_id' in new_row and (i > 0 or forecast_offset):
                         new_row['__mindsdb_row_id'] = None
                     rows.append(new_row)
 
                     new_explanation = copy.deepcopy(last_explanation)
                     for col in ('predicted_value', 'confidence', 'confidence_lower_bound', 'confidence_upper_bound'):
-                        if horizon > 1:
-                            new_explanation[predict][col] = new_explanation[predict][col][i]
+                        if horizon > 1 and col in new_explanation[target]:
+                            new_explanation[target][col] = new_explanation[target][col][i]
                     if i != 0:
-                        new_explanation[predict]['anomaly'] = None
-                        new_explanation[predict]['truth'] = None
+                        new_explanation[target]['anomaly'] = None
+                        new_explanation[target]['truth'] = None
                     explanations.append(new_explanation)
 
             pred_dicts = []
@@ -563,18 +263,18 @@ class LightwoodHandler(PredictiveHandler):
                 pred_dicts.extend(data['rows'])
                 explanations.extend(data['explanations'])
 
-            original_target_values[f'{predict}_original'] = []
+            original_target_values[f'{target}_original'] = []
             for i in range(len(pred_dicts)):
-                original_target_values[f'{predict}_original'].append(explanations[i][predict].get('truth', None))
+                original_target_values[f'{target}_original'].append(explanations[i][target].get('truth', None))
 
-            if predictor_record.dtype_dict[order_by_column] == dtype.date:
+            if dtype_dict[order_by_column] == dtype.date:
                 for row in pred_dicts:
                     if isinstance(row[order_by_column], (int, float)):
-                        row[order_by_column] = str(datetime.fromtimestamp(row[order_by_column]).date())
-            elif predictor_record.dtype_dict[order_by_column] == dtype.datetime:
+                        row[order_by_column] = datetime.fromtimestamp(row[order_by_column]).date()
+            elif dtype_dict[order_by_column] == dtype.datetime:
                 for row in pred_dicts:
                     if isinstance(row[order_by_column], (int, float)):
-                        row[order_by_column] = str(datetime.fromtimestamp(row[order_by_column]))
+                        row[order_by_column] = datetime.fromtimestamp(row[order_by_column])
 
             explain_arr = explanations
         # endregion
@@ -585,7 +285,7 @@ class LightwoodHandler(PredictiveHandler):
         keys = [x for x in pred_dicts[0] if x in columns]
         min_max_keys = []
         for col in predicted_columns:
-            if predictor_record.dtype_dict[col] in (dtype.integer, dtype.float, dtype.num_tsarray):
+            if dtype_dict[col] in (dtype.integer, dtype.float, dtype.num_tsarray):
                 min_max_keys.append(col)
 
         data = []
@@ -596,7 +296,7 @@ class LightwoodHandler(PredictiveHandler):
             explains.append(explain_arr[i])
 
         for i, row in enumerate(data):
-            cast_row_types(row, predictor_record.dtype_dict)
+            cast_row_types(row, dtype_dict)
 
             for k in original_target_values:
                 try:
@@ -620,20 +320,20 @@ class LightwoodHandler(PredictiveHandler):
                 if 'confidence_upper_bound' in explanation[key]:
                     row[key + '_max'] = explanation[key]['confidence_upper_bound']
 
-        return data
-
-    def analyze_dataset(self, data_frame: pd.DataFrame) -> dict:
-        analysis = lightwood.analyze_dataset(data_frame)
-        return analysis.to_dict()
+        return pd.DataFrame(data)
 
     def edit_json_ai(self, name: str, json_ai: dict):
-        predictor_record = db.session.query(db.Predictor).filter_by(company_id=self.company_id, name=name).first()
+        predictor_record = get_model_record(name=name, ml_handler_name='lightwood')
         assert predictor_record is not None
 
         json_ai = lightwood.JsonAI.from_dict(json_ai)
         predictor_record.code = lightwood.code_from_json_ai(json_ai)
-        predictor_record.json_ai = json_ai.to_dict()
         db.session.commit()
+
+        json_storage = get_json_storage(
+            resource_id=predictor_record.id
+        )
+        json_storage.set('json_ai', json_ai.to_dict())
 
     def code_from_json_ai(self, json_ai: dict):
         json_ai = lightwood.JsonAI.from_dict(json_ai)
@@ -645,59 +345,104 @@ class LightwoodHandler(PredictiveHandler):
         if self.config.get('cloud', False):
             raise Exception('Code editing prohibited on cloud')
 
-        predictor_record = db.session.query(db.Predictor).filter_by(company_id=self.company_id, name=name).first()
+        predictor_record = get_model_record(name=name, ml_handler_name='lightwood')
         assert predictor_record is not None
 
         lightwood.predictor_from_code(code)
         predictor_record.code = code
-        predictor_record.json_ai = None
         db.session.commit()
 
-    def join(self, stmt, data_handler: BaseHandler, into: Optional[str] = None) -> pd.DataFrame:
-        """
-        Batch prediction using the output of a query passed to a data handler as input for the model.
-        """  # noqa
-        model_name, model_alias, model_side = get_model_name(self, stmt)
-        data_side = 'right' if model_side == 'left' else 'left'
-        model = self._get_model(model_name)
-        is_ts = model.problem_definition.timeseries_settings.is_timeseries
+        json_storage = get_json_storage(
+            resource_id=predictor_record.id
+        )
+        json_storage.delete('json_ai')
 
-        if not is_ts:
-            model_input = get_join_input(stmt, model, [model_name, model_alias], data_handler, data_side)
+    def _get_features_info(self):
+        ai_info = self.model_storage.json_get('json_ai')
+        if ai_info == {}:
+            raise Exception("predictor doesn't contain enough data to generate 'feature' attribute.")
+        data = []
+        dtype_dict = ai_info["dtype_dict"]
+        for column in dtype_dict:
+            c_data = []
+            c_data.append(column)
+            c_data.append(dtype_dict[column])
+            c_data.append(ai_info["encoders"][column]["module"])
+            if ai_info["encoders"][column]["args"].get("is_target", "False") == "True":
+                c_data.append("target")
+            else:
+                c_data.append("feature")
+            data.append(c_data)
+
+        return pd.DataFrame(data, columns=['column', 'type', 'encoder', 'role'])
+
+    def _get_model_info(self):
+        json_ai = self.model_storage.json_get('json_ai')
+        model_info = self.model_storage.get_info()
+        model_data = model_info['data']
+
+        accuracy_functions = json_ai.get('accuracy_functions')
+        if accuracy_functions:
+            accuracy_functions = str(accuracy_functions)
+
+        models_data = model_data.get("submodel_data", [])
+        if models_data == []:
+            raise Exception("predictor doesn't contain enough data to generate 'model' attribute")
+        data = []
+
+        for model in models_data:
+            m_data = []
+            m_data.append(model["name"])
+            m_data.append(model["accuracy"])
+            m_data.append(model.get("training_time", "unknown"))
+            m_data.append(1 if model["is_best"] else 0)
+            m_data.append(accuracy_functions)
+            data.append(m_data)
+
+        return pd.DataFrame(data, columns=['name', 'performance', 'training_time', 'selected', 'accuracy_functions'])
+
+    def _get_ensemble_data(self):
+        ai_info = self.model_storage.json_get('json_ai')
+        if ai_info == {}:
+            raise Exception("predictor doesn't contain enough data to generate 'ensamble' attribute. Please wait until predictor is complete.")
+        ai_info_str = json.dumps(ai_info, indent=2)
+
+        return pd.DataFrame([[ai_info_str]], columns=['ensemble'])
+
+    def describe(self, attribute: Optional[str] = None) -> pd.DataFrame:
+        if attribute is None:
+
+            model_description = {}
+
+            model_info = self.model_storage.get_info()
+            model_data = model_info['data']
+            to_predict = model_info['to_predict'][0]
+            json_ai = self.model_storage.json_get('json_ai')
+
+            if model_data.get('accuracies', None) is not None:
+                if len(model_data['accuracies']) > 0:
+                    model_data['accuracy'] = float(np.mean(list(model_data['accuracies'].values())))
+
+            model_columns = self.model_storage.columns_get()
+
+            model_description['accuracies'] = model_data['accuracies']
+            model_description['column_importances'] = model_data['column_importances']
+            model_description['outputs'] = [to_predict]
+            model_description['inputs'] = [col for col in model_columns if col not in model_description['outputs']]
+            model_description['model'] = ' --> '.join(str(k) for k in json_ai)
+
+            return pd.DataFrame([model_description])
+
         else:
-            model_input = get_ts_join_input(stmt, model, data_handler, data_side)
+            if attribute == "features":
+                return self._get_features_info()
 
-        # get model output and rename columns
-        predictions = self._call_predictor(model_input, model)
-        model_input.columns = get_aliased_columns(list(model_input.columns), model_alias, stmt.targets, mode='input')
-        predictions.columns = get_aliased_columns(list(predictions.columns), model_alias, stmt.targets, mode='output')
+            elif attribute == "model":
+                return self._get_model_info()
 
-        if into:
-            try:
-                dtypes = {}
-                for col in predictions.columns:
-                    if model.dtype_dict.get(col, False):
-                        dtypes[col] = self.lw_dtypes_to_sql.get(col, sqlalchemy.Text)
-                    else:
-                        dtypes[col] = self.lw_dtypes_overrides.get(col, sqlalchemy.Text)
+            elif attribute == "ensemble":
+                return self._get_ensemble_data()
 
-                data_handler.select_into(into, predictions, dtypes=dtypes)
-            except Exception:
-                print("Error when trying to store the JOIN output in data handler.")
+            else:
+                raise Exception("DESCRIBE '%s' predictor attribute is not supported yet" % attribute)
 
-        return predictions
-
-    def _get_model(self, model_name):
-        predictor_dict = self._get_model_info(model_name)
-        predictor = load_predictor(predictor_dict, model_name)
-        return predictor
-
-    def _get_model_info(self, model_name):
-        """ Returns a dictionary with three keys: 'jsonai', 'predictor' (serialized), and 'code'. """  # noqa
-        return self.storage.get('models')[model_name]
-
-    def _call_predictor(self, df, predictor):
-        predictions = predictor.predict(df)
-        if 'original_index' in predictions.columns:
-            predictions = predictions.sort_values(by='original_index')
-        return df.join(predictions)

@@ -16,7 +16,7 @@ from mindsdb_sql.parser.ast.base import ASTNode
 from mindsdb_sql.parser.ast import DropTables, Select
 
 from mindsdb.api.mysql.mysql_proxy.utilities.sql import query_df
-from mindsdb.integrations.libs.base_handler import DatabaseHandler
+from mindsdb.integrations.libs.base import DatabaseHandler
 from mindsdb.integrations.libs.response import (
     HandlerStatusResponse as StatusResponse,
     HandlerResponse as Response,
@@ -41,11 +41,11 @@ class FileHandler(DatabaseHandler):
     """
     name = 'files'
 
-    def __init__(self, name=None, db_store=None, fs_store=None, connection_data=None, file_controller=None):
+    def __init__(self, name=None, file_storage=None, connection_data={}, file_controller=None, **kwargs):
         super().__init__(name)
         self.parser = parse_sql
-        self.fs_store = fs_store
-        self.custom_parser = connection_data.get('custom_parser')
+        self.fs_store = file_storage
+        self.custom_parser = connection_data.get('custom_parser', None)
         self.clean_rows = connection_data.get('clean_rows', True)
         self.file_controller = file_controller
 
@@ -103,10 +103,15 @@ class FileHandler(DatabaseHandler):
         if custom_parser:
             header, file_data = custom_parser(data, fmt)
 
+        elif fmt == 'parquet':
+            df = pd.read_parquet(data)
+            header = df.columns.values.tolist()
+            file_data = df.values.tolist()
+
         elif fmt == 'csv':
-            csv_reader = list(csv.reader(data, dialect))
-            header = csv_reader[0]
-            file_data = csv_reader[1:]
+            df = pd.read_csv(data, sep=dialect.delimiter)
+            header = df.columns.values.tolist()
+            file_data = df.values.tolist()
 
         elif fmt in ['xlsx', 'xls']:
             data.seek(0)
@@ -163,6 +168,19 @@ class FileHandler(DatabaseHandler):
         # check for file type
         ############
 
+        # Check first and last 4 bytes equal to PAR1.
+        # Refer: https://parquet.apache.org/docs/file-format/
+        parquet_sig = b'PAR1'
+        data.seek(0, 0)
+        start_meta = data.read(4)
+        data.seek(-4, 2)
+        end_meta = data.read()
+        data.seek(0)
+        if start_meta == parquet_sig and end_meta == parquet_sig:
+            return data, 'parquet', None
+        else:
+            print("It's not parquet file. Checking for other formats")
+
         # try to guess if its an excel file
         xlsx_sig = b'\x50\x4B\x05\06'
         # xlsx_sig2 = b'\x50\x4B\x03\x04'
@@ -203,11 +221,13 @@ class FileHandler(DatabaseHandler):
                     explain=False
                 )
                 best_meta = file_encoding_meta.best()
+                errors = 'strict'
                 if best_meta is not None:
                     encoding = file_encoding_meta.best().encoding
                 else:
                     encoding = 'utf-8'
-                data = StringIO(byte_str.decode(encoding))
+                    errors = 'replace'
+                data = StringIO(byte_str.decode(encoding, errors))
         except Exception:
             print(traceback.format_exc())
             print('Could not load into string')
@@ -254,11 +274,14 @@ class FileHandler(DatabaseHandler):
 
     @staticmethod
     def _get_csv_dialect(buffer) -> csv.Dialect:
-        sample = buffer.read(128 * 1024)
+        sample = buffer.readline()  # trying to get dialect from header
         buffer.seek(0)
         try:
+            if isinstance(sample, bytes):
+                sample = sample.decode()
             accepted_csv_delimiters = [',', '\t', ';']
             dialect = csv.Sniffer().sniff(sample, delimiters=accepted_csv_delimiters)
+            dialect.doublequote = True  # assume that all csvs have " as string escape
         except csv.Error:
             dialect = None
         return dialect
@@ -287,7 +310,8 @@ class FileHandler(DatabaseHandler):
         files_meta = self.file_controller.get_files()
         data = [{
             'TABLE_NAME': x['name'],
-            'TABLE_ROWS': x['row_count']
+            'TABLE_ROWS': x['row_count'],
+            'TABLE_TYPE': 'BASE TABLE'
         } for x in files_meta]
         return Response(
             RESPONSE_TYPE.TABLE,

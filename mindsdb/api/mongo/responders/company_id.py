@@ -1,5 +1,5 @@
 from mindsdb.api.mongo.classes import Responder
-from mindsdb.utilities.with_kwargs_wrapper import WithKWArgsWrapper
+from mindsdb.utilities.context import context as ctx
 
 
 class Responce(Responder):
@@ -11,16 +11,8 @@ class Responce(Responder):
         user_class = query.get('user_class', 0)
         need_response = query.get('need_response', False)
 
-        mindsdb_env['user_class'] = user_class
-        mindsdb_env['company_id'] = company_id
-        mindsdb_env['model_controller'] = WithKWArgsWrapper(
-            mindsdb_env['origin_model_controller'],
-            company_id=company_id
-        )
-        mindsdb_env['integration_controller'] = WithKWArgsWrapper(
-            mindsdb_env['origin_integration_controller'],
-            company_id=company_id
-        )
+        ctx.company_id = company_id
+        ctx.user_class = user_class
 
         if need_response:
             return {'ok': 1}

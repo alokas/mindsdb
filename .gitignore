@@ -14,6 +14,7 @@ tests/integration_tests/flows/model.py
 tests/integration_tests/flows/my_model.zip
 distributions/docker-compose/*/storage
 venv/*
+env/*
 mindsdb-venv/*
 root
 static
@@ -30,3 +31,15 @@ MindsDB.egg-info/*
 .history
 doc/lib/
 run.csh
+
+# Virtualenv
+bin
+lib
+lib64
+pyvenv.cfg
+.python-version
+.DS_Store
+
+
+# Docs
+node_modules
